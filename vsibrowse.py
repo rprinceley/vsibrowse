@@ -14,6 +14,10 @@ from PyQt6 import uic
 from datetime import datetime
 import os
 import msal
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
+import qdarktheme
 
 from osgeo import gdal
 
@@ -88,6 +92,37 @@ class AzureOAuthDialog(QDialog):
         self.done(QDialog.DialogCode.Accepted)
 
 
+class GoogleOAuthDialog(QDialog):
+    def __init__(self, parent):
+        super(GoogleOAuthDialog, self).__init__(parent)
+        ui_path = os.path.join(os.path.dirname(__file__), 'ui', 'gs_oauth.ui')
+        uic.loadUi(ui_path, self)
+        self.connectButton.setIcon(QIcon('ui:network-acquiring-symbolic.svg'))
+        self.cancelButton.setIcon(QIcon('ui:window-close.svg'))
+        self.browseButton.setIcon(QIcon('ui:document-open-symbolic.svg'))
+        self.browseButton.clicked.connect(self.onBrowse)
+        self.connectButton.clicked.connect(self.onConnect)
+        self.cancelButton.clicked.connect(self.reject)
+
+    def onBrowse(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 'Select JSON file', QDir.homePath(), 'JSON files (*.json)')
+        if file_path:
+            self.clientSecretsFileEdit.setText(file_path)
+
+    def onConnect(self) -> None:
+        if not self.clientSecretsFileEdit.text():
+            QMessageBox.warning(self, 'Missing JSON', 'Please enter JSON file path')
+            return
+        if not self.scopeEdit.text():
+            QMessageBox.warning(self, 'Missing Scope', 'Please enter a scope')
+            return
+        if not self.containerEdit.text():
+            QMessageBox.warning(self, 'Missing Container', 'Please enter a container')
+            return
+        self.done(QDialog.DialogCode.Accepted)
+
+
 class VSIFileSystemBrowser(QMainWindow):
     def __init__(self):
         super(VSIFileSystemBrowser, self).__init__()
@@ -102,7 +137,10 @@ class VSIFileSystemBrowser(QMainWindow):
         self.connectMenu = QMenu(self)
         azureOAuthAction = self.connectMenu.addAction('Connect to Azure (OAuth)')
         azureOAuthAction.triggered.connect(self.connectToAzureOAuth)
-        azureOAuthAction.setIcon(QIcon('ui:oauth_logo.svg'))
+        azureOAuthAction.setIcon(QIcon('ui:az_store.svg'))
+        googleOAuthAction = self.connectMenu.addAction('Connect to Google (OAuth)')
+        googleOAuthAction.triggered.connect(self.connectToGoogleOAuth)
+        googleOAuthAction.setIcon(QIcon('ui:cloud_storage.svg'))
         self.connectButton.setIcon(QIcon('ui:folder-remote-symbolic.svg'))
         self.connectButton.setMenu(self.connectMenu)
         self.treeView.setContextMenuPolicy(
@@ -121,8 +159,9 @@ class VSIFileSystemBrowser(QMainWindow):
         self.sslAction.triggered.connect(self.sslActionTriggered)
         self.sslJSON = None
         self.msalApp = None
+        self.googleCredentials = None
         self.oAuthTimer = QTimer()
-        self.oAuthTimer.timeout.connect(self.refreshAzureOAuth)
+        self.oAuthTimer.timeout.connect(self.refreshOAuth)
         self.oAuthTimer.setSingleShot(True)
         self.oAuthScope = None
         self.oAuthBucketPath = None
@@ -159,7 +198,7 @@ class VSIFileSystemBrowser(QMainWindow):
     def updateSSLStatus(self) -> None:
         if not self.url:
             return
-        if not 'GetSSLCertificates' in dir(gdal): # Esri builds only
+        if not 'GetSSLCertificates' in dir(gdal):  # Esri builds only
             return
         object_url = find_a_object_in_container(self.url)
         if object_url:
@@ -219,6 +258,7 @@ class VSIFileSystemBrowser(QMainWindow):
                 if dialog.typeComboBox.currentText() == 'ADLS':
                     vsi_path = '/vsiadls/'
                 vsi_path += dialog.containerEdit.text()
+                self.oAuthBucketPath = vsi_path
                 gdal.SetPathSpecificOption(
                     vsi_path, 'AZURE_STORAGE_ACCOUNT', dialog.accountEdit.text())
                 gdal.SetPathSpecificOption(
@@ -227,21 +267,67 @@ class VSIFileSystemBrowser(QMainWindow):
                 self.updateSSLStatus()
                 time_left = int(result['expires_in']) - 60
                 self.oAuthTimer.setInterval(time_left * 1000)
+                self.oAuthTimer.start()
 
-    def refreshAzureOAuth(self) -> None:
-        if not self.msalApp:
+    def connectToGoogleOAuth(self) -> None:
+        dialog = GoogleOAuthDialog(self)
+        secrets_file = os.getenv('GDALTEST_GS_APP_JSON')
+        if secrets_file is not None:
+            dialog.clientSecretsFileEdit.setText(secrets_file)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            scopes = ['openid',
+                      dialog.scopeEdit.text()]
+            flowApp = InstalledAppFlow.from_client_secrets_file(
+                dialog.clientSecretsFileEdit.text(),
+                scopes=scopes)
+            self.googleCredentials = flowApp.run_local_server()
+            if self.googleCredentials is not None and self.googleCredentials.token is not None:
+                self.oAuthScope = dialog.scopeEdit.text()
+                vsi_path = '/vsigs/' + dialog.containerEdit.text()
+                self.oAuthBucketPath = vsi_path
+                gdal.SetCredential(vsi_path, 'GDAL_HTTP_HEADERS', 'Authorization: Bearer {access_token}'.format(
+                    access_token=self.googleCredentials.token))
+                self.populate(vsi_path)
+                self.updateSSLStatus()
+                # time_left = self.googleCredentials.expiry - datetime.now()
+                # time_left = time_left.total_seconds()
+                # self.oAuthTimer.setInterval(time_left * 1000)
+                # self.oAuthTimer.start()
+            else:
+                error_dialog = QErrorMessage(self)
+                error_dialog.showMessage('Failed to get access token.')
+
+    def refreshOAuth(self) -> None:
+        time_left = 0
+        self.oAuthTimer.stop()
+        if not self.msalApp and not self.googleCredentials:
             return
         if not self.oAuthScope or self.oAuthScope == '':
             return
         if self.url != self.oAuthBucketPath:
             return
-        result = self.msalApp.acquire_token_silent(self.oAuthScope, account=None)
-        if not result:
-            access_token = result['access_token']
-            gdal.SetPathSpecificOption(
-                self.oAuthBucketPath, 'AZURE_STORAGE_ACCESS_TOKEN', access_token)
-            time_left = int(result['expires_in']) - 60
+        if self.msalApp is not None:
+            result = self.msalApp.acquire_token_silent(self.oAuthScope, account=None)
+            if not result:
+                access_token = result['access_token']
+                gdal.SetPathSpecificOption(
+                    self.oAuthBucketPath, 'AZURE_STORAGE_ACCESS_TOKEN', access_token)
+                time_left = int(result['expires_in']) - 60
+        # elif self.googleCredentials is not None:
+        #     try:
+        #         self.googleCredentials.refresh(Request())
+        #     except RefreshError:
+        #         error_dialog = QErrorMessage(self)
+        #         error_dialog.showMessage('Failed to refresh access token')
+        #         return
+        #     else:
+        #         gdal.SetCredential(self.oAuthBucketPath, 'GDAL_HTTP_HEADERS', 'Authorization: Bearer {access_token}'.format(
+        #             access_token=self.googleCredentials.token))
+        #         time_left = self.googleCredentials.expiry - datetime.now()
+        #         time_left = int(time_left.total_seconds()) - 60
+        if time_left > 0:
             self.oAuthTimer.setInterval(time_left * 1000)
+            self.oAuthTimer.start()
 
     def context_menu(self) -> None:
         menu = QMenu()
@@ -283,6 +369,10 @@ class VSIFileSystemBrowser(QMainWindow):
 class BrowserApplication(QApplication):
     def __init__(self, argv: List[str]) -> None:
         super().__init__(argv)
+    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     def connectGDAL(self, browser: VSIFileSystemBrowser) -> None:
         gdal.PushErrorHandler(browser.errorHandler)
@@ -292,7 +382,9 @@ if __name__ == '__main__':
     QDir.addSearchPath('ui', os.fspath(Path(__file__).resolve().parent / 'ui'))
     update_extension_mapping()
     url = PurePosixPath('/vsis3') / 'gdal-io-test'
+    qdarktheme.enable_hi_dpi()
     app = BrowserApplication([])
+    qdarktheme.setup_theme()
     browser = VSIFileSystemBrowser()
     app.connectGDAL(browser)
     browser.populate(str(url))
