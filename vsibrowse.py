@@ -3,309 +3,108 @@
 Simple cloud browser example using GDAL virtual filesystem and PyQt6.
 @author: Robin Princeley
 """
+import json
 from pathlib import Path, PurePosixPath
 import traceback
 from typing import Any, List, Dict
-from PyQt6.QtCore import QObject, pyqtSlot, QAbstractItemModel, QModelIndex, QThreadPool, QRunnable, QDir, pyqtSignal, Qt
+from PyQt6.QtCore import QModelIndex, QThreadPool, QDir, Qt, QTimer
 from PyQt6.QtGui import QIcon, QCursor
-from PyQt6.QtWidgets import QApplication, QMainWindow, QTableWidgetItem, QMenu, QAbstractScrollArea, QFileDialog
+from PyQt6.QtWidgets import QApplication, QMainWindow, QTableWidgetItem, QMenu, QAbstractScrollArea, QFileDialog, QDialog, QTreeWidgetItem, QLineEdit, QErrorMessage, QMessageBox
+from PyQt6 import uic
 from datetime import datetime
 import os
+import msal
+
 from osgeo import gdal
-from humanfriendly import format_size
 
-from ui import main
-
-
-extension_mapping: Dict[str, str] = {}
+from vsistuff import *
 
 
-# Create a extension to short name mapping for drivers
-def update_extenion_mapping() -> bool:
-    global extension_mapping
-    if len(extension_mapping) != 0:
-        return
-    count = gdal.GetDriverCount()
-    for i in reversed(range(0, count)):
-        driver = gdal.GetDriver(i)
-        if driver:
-            name = driver.ShortName
-            metadata = driver.GetMetadata()
-            if gdal.DMD_EXTENSION in metadata:
-                ext = metadata[gdal.DMD_EXTENSION].lower()
-                extension_mapping[ext] = name
-            if gdal.DMD_EXTENSIONS in metadata:
-                ext_string = metadata[gdal.DMD_EXTENSIONS]
-                if ext_string:
-                    ext_string = ext_string.lower()
-                    ext_string = ext_string.replace(',', ' ')
-                    ext_string = ext_string.replace(';', ' ')
-                    tmp_list = ext_string.split()
-                    for ext in tmp_list:
-                        extension_mapping[ext] = name
-    extension_mapping.pop('xml', None)
-    extension_mapping.pop('bin', None)
-    extension_mapping.pop('txt', None)
+class SSLCertificateDialog(QDialog):
+    def __init__(self, parent, ssl_json=None):
+        super(SSLCertificateDialog, self).__init__(parent)
+        ui_path = os.path.join(os.path.dirname(__file__), 'ui', 'ssldialog.ui')
+        uic.loadUi(ui_path, self)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        if ssl_json:
+            root_item = QTreeWidgetItem(self.sslTreeWidget)
+            root_item.setText(0, '/')
+            self.sslTreeWidget.addTopLevelItem(root_item)
+            item_parent = root_item
+            for certificate in reversed(ssl_json['Certificates']):
+                name = certificate['Subject'].split('/CN=', 1)[1]
+                cert_item = QTreeWidgetItem(item_parent)
+                cert_item.setText(0, name)
+                item_parent = cert_item
+                for field in certificate:
+                    if field == 'PEM':
+                        continue
+                    elif field == 'Extensions':
+                        ext_root_item = QTreeWidgetItem(cert_item)
+                        ext_root_item.setText(0, 'Extensions')
+                        extensions = certificate[field]
+                        for i in range(len(extensions)):
+                            ext_dict = extensions[i]
+                            for key, value in ext_dict.items():
+                                ext_item = QTreeWidgetItem(ext_root_item)
+                                ext_item.setText(0, key)
+                                ext_item.setText(1, str(value))
+                    else:
+                        field_item = QTreeWidgetItem(cert_item)
+                        field_item.setText(0, field)
+                        field_item.setText(1, str(certificate[field]))
+        self.sslTreeWidget.expandAll()
+        self.sslTreeWidget.resizeColumnToContents(0)
+        self.sslTreeWidget.resizeColumnToContents(1)
 
 
-# Match exxtention of a url to driver short name
-def find_driver_for_url(url: PurePosixPath) -> str:
-    global extension_mapping
-    ext = url.suffix
-    if not ext:
-        return None
-    if ext[:1] == '.':
-        ext = ext[1:]
-    return extension_mapping.get(ext)
+class AzureOAuthDialog(QDialog):
+    def __init__(self, parent):
+        super(AzureOAuthDialog, self).__init__(parent)
+        ui_path = os.path.join(os.path.dirname(__file__), 'ui', 'az_oauth.ui')
+        uic.loadUi(ui_path, self)
+        self.connectButton.setIcon(QIcon('ui:network-acquiring-symbolic.svg'))
+        self.cancelButton.setIcon(QIcon('ui:window-close.svg'))
+        self.connectButton.clicked.connect(self.onConnect)
+        self.cancelButton.clicked.connect(self.reject)
+
+    def onConnect(self) -> None:
+        if not self.applicationIDEdit.text():
+            QMessageBox.warning(self, 'Missing Application ID',
+                                'Please enter an Application ID')
+            return
+        if not self.authorityEdit.text():
+            QMessageBox.warning(self, 'Missing Authority', 'Please enter an Authority')
+            return
+        if not self.scopeEdit.text():
+            QMessageBox.warning(self, 'Missing Scope', 'Please enter a scope')
+            return
+        if not self.accountEdit.text():
+            QMessageBox.warning(self, 'Missing Account', 'Please enter an account')
+            return
+        if not self.containerEdit.text():
+            QMessageBox.warning(self, 'Missing Container', 'Please enter a container')
+            return
+        self.done(QDialog.DialogCode.Accepted)
 
 
-# Structure to repersent a VSI filesystem object
-class VSIItem(object):
-    def __init__(self, url: PurePosixPath, parent) -> None:
-        self._url = url
-        self._parent = parent
-        self._children = []
-        self._metadata = {}
-        self._is_dir = False
-        self._mtime = 0
-        self._size = 0
-        # stat() to figure out details
-        stat = gdal.VSIStatL(
-            str(url), gdal.VSI_STAT_EXISTS_FLAG | gdal.VSI_STAT_NATURE_FLAG)
-        if stat:
-            self._mtime = stat.mtime
-            self._size = stat.size
-            self._is_dir = stat.IsDirectory()
-        # See if the extension matches a driver
-        self._driver = find_driver_for_url(self._url)
-        self._row = 0
-        self._attempted_listing = False
-        self._attempted_metadata = False
-
-    # Populate one level of children in on this node
-    def populate_children(self) -> bool:
-        if not self._attempted_listing:
-            self._attempted_listing = True
-            if self._is_dir:
-                dir_handle = gdal.OpenDir(str(self._url), 0)
-                if dir_handle is None:
-                    return False
-                entry = gdal.GetNextDirEntry(dir_handle)
-                row = 0
-                while entry is not None:
-                    child = VSIItem(self._url / entry.name, self)
-                    child._parent = self
-                    child._row = row
-                    self._children.append(child)
-                    row = row + 1
-                    entry = gdal.GetNextDirEntry(dir_handle)
-                gdal.CloseDir(dir_handle)
-        return len(self._children) != 0
-
-    # Fetch object metadata
-    def get_metadata(self) -> bool:
-        if not self._attempted_metadata:
-            self._attempted_metadata = True
-            if not self.isDir():
-                for domain in ['HEADERS', 'TAGS', 'STATUS', 'ACL', 'METADATA']:
-                    meta = gdal.GetFileMetadata(str(self._url), domain)
-                    if meta and len(meta) != 0:
-                        self._metadata = self._metadata | meta
-        return len(self._metadata) != 0
-
-    def data(self, column) -> str | int | None:
-        if column == 0:
-            return self._url.name
-        elif column == 1:
-            if self._is_dir:
-                return 'Folder'
-            elif self._driver:
-                return '{driver} Dataset'.format(driver=self._driver)
-            else:
-                return 'Object'
-        elif column == 2:
-            if self._is_dir:
-                return self.childCount()
-            else:
-                return format_size(self._size)
-        elif column == 3:
-            if self._mtime != 0:
-                return str(datetime.fromtimestamp(self._mtime))
-
-    def columnCount(self) -> int:
-        return 4
-
-    def childCount(self) -> int:
-        return len(self._children)
-
-    def child(self, row):
-        if row >= 0 and row < self.childCount():
-            return self._children[row]
-
-    def parent(self):
-        return self._parent
-
-    def row(self) -> int:
-        return self._row
-
-    def canFetchMore(self) -> bool:
-        if self._is_dir and not self._attempted_listing:
-            return True
-        return False
-
-    def isDir(self) -> bool:
-        return self._is_dir
-
-    def metadata(self) -> Dict[str, str]:
-        return self._metadata
-
-    def canFetchMetadata(self) -> bool:
-        if not self._is_dir and not self._attempted_metadata:
-            return True
-        return False
-
-    def isDriverKnown(self) -> bool:
-        return self._driver is not None
-
-    def url(self) -> PurePosixPath:
-        return self._url
-
-
-class VSIFileSystemModel(QAbstractItemModel):
-    def __init__(self, url: PurePosixPath) -> None:
-        super(VSIFileSystemModel, self).__init__()
-        self._root = VSIItem(url, None)
-
-    def rowCount(self, index):
-        if index.isValid() and index.internalPointer():
-            return index.internalPointer().childCount()
-        return self._root.childCount()
-
-    def index(self, row, column, parent=None) -> QModelIndex:
-        if not parent or not parent.isValid():
-            node = self._root
-        else:
-            node = parent.internalPointer()
-
-        if not QAbstractItemModel.hasIndex(self, row, column, parent):
-            return QModelIndex()
-
-        child = node.child(row)
-        if child:
-            return QAbstractItemModel.createIndex(self, row, column, child)
-        else:
-            return QModelIndex()
-
-    def parent(self, index) -> QModelIndex:
-        if index.isValid():
-            p = index.internalPointer().parent()
-            if p:
-                return QAbstractItemModel.createIndex(self, p.row(), 0, p)
-        return QModelIndex()
-
-    def columnCount(self, index) -> int:
-        return self._root.columnCount()
-
-    def data(self, index, role) -> str | int | Qt.AlignmentFlag | QIcon | None:
-        if not index.isValid():
-            return None
-        node = index.internalPointer()
-        if role == Qt.ItemDataRole.DisplayRole:
-            return node.data(index.column())
-        elif role == Qt.ItemDataRole.TextAlignmentRole and index.column() == 2:
-            return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        elif role == Qt.ItemDataRole.DecorationRole and index.column() == 0:
-            if node.isDir():
-                return QIcon('icons:folder-blue.svg')
-            elif node.isDriverKnown():
-                return QIcon('icons:image-x-generic.svg')
-            else:
-                return QIcon('icons:unknown.svg')
-        return None
-
-    def headerData(self, section, orientation, role) -> str | Qt.AlignmentFlag | Any:
-        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            if section == 0:
-                return 'Name'
-            elif section == 1:
-                return 'Type'
-            elif section == 2:
-                return 'Size'
-            elif section == 3:
-                return 'Date / Time'
-        elif role == Qt.ItemDataRole.TextAlignmentRole and section == 2:
-            return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        return super().headerData(section, orientation, role)
-
-    def canFetchMore(self, parent) -> bool:
-        if not parent or not parent.isValid():
-            node = self._root
-        else:
-            node = parent.internalPointer()
-        return node.canFetchMore()
-
-    def fetchMore(self, parent) -> None:
-        if not parent or not parent.isValid():
-            node = self._root
-        else:
-            node = parent.internalPointer()
-        if node.canFetchMore():
-            node.populate_children()
-            count = len(node._children)
-            self.beginInsertRows(parent, 0, count)
-            self.endInsertRows()
-
-    def hasChildren(self, parent) -> bool:
-        if not parent or not parent.isValid():
-            node = self._root
-        else:
-            node = parent.internalPointer()
-        if node.canFetchMore() or node.childCount():
-            return True
-        return False
-
-
-# Signals for Sync() worker
-class VSISyncSignals(QObject):
-    finished = pyqtSignal(str, str, int)
-    #progress = pyqtSignal(int)
-
-
-# Worker thread to perform Sync() asynchronously
-class VSISyncWorker(QRunnable):
-    def __init__(self, src: str, dest: str, options: List[str] = None):
-        super(VSISyncWorker, self).__init__()
-        self.src = src
-        self.dest = dest
-        self.options = options
-        self.signals = VSISyncSignals()
-
-    @pyqtSlot()
-    def run(self) -> None:
-        try:
-            result = gdal.Sync(self.src, self.dest)
-        except:
-            traceback.print_exc()
-            self.signals.finished.emit(self.src, self.dest, 0)
-        else:
-            self.signals.finished.emit(self.src, self.dest, result)
-
-    # def progress_cb(self, complete, message, cb_data) -> None:
-    #     self.signals.progress.emit(complete)
-
-
-class VSIFileSystemBrowser(main.Ui_MainWindow, QMainWindow):
+class VSIFileSystemBrowser(QMainWindow):
     def __init__(self):
         super(VSIFileSystemBrowser, self).__init__()
+        ui_path = os.path.join(os.path.dirname(__file__), 'ui', 'main.ui')
+        uic.loadUi(ui_path, self)
         self.url = ''
         self.model = None
-        self.setupUi(self)
-        self.ui_dir = Path(__file__).resolve().parent / 'ui'
-        QDir.addSearchPath('icons', os.fspath(self.ui_dir))
         self.threadpool = QThreadPool()
-        self.tabWidget.setTabIcon(0, QIcon('icons:help-info-symbolic.svg'))
-        self.tabWidget.setTabIcon(1, QIcon('icons:text-x-log.svg'))
-        self.refreshButton.setIcon(QIcon('icons:view-refresh-symbolic.svg'))
+        self.tabWidget.setTabIcon(0, QIcon('ui:help-info-symbolic.svg'))
+        self.tabWidget.setTabIcon(1, QIcon('ui:text-x-log.svg'))
+        self.refreshButton.setIcon(QIcon('ui:view-refresh-symbolic.svg'))
+        self.connectMenu = QMenu(self)
+        azureOAuthAction = self.connectMenu.addAction('Connect to Azure (OAuth)')
+        azureOAuthAction.triggered.connect(self.connectToAzureOAuth)
+        azureOAuthAction.setIcon(QIcon('ui:oauth_logo.svg'))
+        self.connectButton.setIcon(QIcon('ui:folder-remote-symbolic.svg'))
+        self.connectButton.setMenu(self.connectMenu)
         self.treeView.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         self.treeView.customContextMenuRequested.connect(self.context_menu)
@@ -317,6 +116,16 @@ class VSIFileSystemBrowser(main.Ui_MainWindow, QMainWindow):
         self.mainSplitter.setStretchFactor(1, 0)
         self.refreshButton.clicked.connect(self.refreshButtonClicked)
         self.urlEdit.returnPressed.connect(self.refreshButtonClicked)
+        self.sslAction = self.urlEdit.addAction(
+            QIcon('ui:channel-insecure-symbolic.svg'), QLineEdit.ActionPosition.LeadingPosition)
+        self.sslAction.triggered.connect(self.sslActionTriggered)
+        self.sslJSON = None
+        self.msalApp = None
+        self.oAuthTimer = QTimer()
+        self.oAuthTimer.timeout.connect(self.refreshAzureOAuth)
+        self.oAuthTimer.setSingleShot(True)
+        self.oAuthScope = None
+        self.oAuthBucketPath = None
 
     def populate(self, url: str) -> None:
         self.url = url
@@ -347,14 +156,97 @@ class VSIFileSystemBrowser(main.Ui_MainWindow, QMainWindow):
                         pos, 1, QTableWidgetItem(value))
             self.propertiesTable.resizeColumnsToContents()
 
+    def updateSSLStatus(self) -> None:
+        if not self.url:
+            return
+        if not 'GetSSLCertificates' in dir(gdal): # Esri builds only
+            return
+        object_url = find_a_object_in_container(self.url)
+        if object_url:
+            http_url = gdal.GetActualURL(object_url)
+            if http_url:
+                cert_list = gdal.GetSSLCertificates(http_url, ['ACTION=OCSP_CHECK'])
+                if cert_list:
+                    self.sslJSON = json.loads(cert_list)
+                    if 'OCSP' in self.sslJSON and self.sslJSON['OCSP'] == 'passed':
+                        self.sslAction.setIcon(
+                            QIcon('ui:channel-secure-validated-symbolic.svg'))
+                        self.sslAction.setToolTip(
+                            'Connection is secure, passed OCSP status check.')
+                    elif 'Verify' in self.sslJSON and self.sslJSON['Verify'] == 'passed':
+                        self.sslAction.setIcon(QIcon('ui:channel-secure-symbolic.svg'))
+                        self.sslAction.setToolTip(
+                            'Connection is secure, passed SSL certificate validation check.')
+                    else:
+                        self.sslAction.setIcon(
+                            QIcon('ui:channel-insecure-symbolic.svg'))
+                        self.sslAction.setToolTip('Connection appears to be insecure.')
+
+    def sslActionTriggered(self) -> None:
+        if self.sslJSON:
+            dialog = SSLCertificateDialog(self, self.sslJSON)
+            dialog.show()
+
     def refreshButtonClicked(self) -> None:
         if self.url != self.urlEdit.text():
             self.populate(self.urlEdit.text())
+            self.updateSSLStatus()
+
+    def connectToAzureOAuth(self) -> None:
+        dialog = AzureOAuthDialog(self)
+        app_id = os.getenv('GDALTEST_AZ_APP_ID')
+        if app_id is not None:
+            dialog.applicationIDEdit.setText(app_id)
+        authority = os.getenv('GDALTEST_AZ_AUTHORITY')
+        if authority is not None:
+            dialog.authorityEdit.setText(authority)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.msalApp = msal.PublicClientApplication(client_id=dialog.applicationIDEdit.text(),
+                                                        authority=dialog.authorityEdit.text())
+            result = self.msalApp.acquire_token_interactive([dialog.scopeEdit.text()])
+            if not 'access_token' in result:
+                error_dialog = QErrorMessage(self)
+                error_string = 'Failed to get access token: '
+                if 'error' in result:
+                    error_string += result['error']
+                if 'error_description' in result:
+                    error_string += ' - ' + result['error_description']
+                error_dialog.showMessage(error_string)
+            else:
+                self.oAuthScope = dialog.scopeEdit.text()
+                access_token = result['access_token']
+                vsi_path = '/vsiaz/'
+                if dialog.typeComboBox.currentText() == 'ADLS':
+                    vsi_path = '/vsiadls/'
+                vsi_path += dialog.containerEdit.text()
+                gdal.SetPathSpecificOption(
+                    vsi_path, 'AZURE_STORAGE_ACCOUNT', dialog.accountEdit.text())
+                gdal.SetPathSpecificOption(
+                    vsi_path, 'AZURE_STORAGE_ACCESS_TOKEN', access_token)
+                self.populate(vsi_path)
+                self.updateSSLStatus()
+                time_left = int(result['expires_in']) - 60
+                self.oAuthTimer.setInterval(time_left * 1000)
+
+    def refreshAzureOAuth(self) -> None:
+        if not self.msalApp:
+            return
+        if not self.oAuthScope or self.oAuthScope == '':
+            return
+        if self.url != self.oAuthBucketPath:
+            return
+        result = self.msalApp.acquire_token_silent(self.oAuthScope, account=None)
+        if not result:
+            access_token = result['access_token']
+            gdal.SetPathSpecificOption(
+                self.oAuthBucketPath, 'AZURE_STORAGE_ACCESS_TOKEN', access_token)
+            time_left = int(result['expires_in']) - 60
+            self.oAuthTimer.setInterval(time_left * 1000)
 
     def context_menu(self) -> None:
         menu = QMenu()
         open = menu.addAction(
-            QIcon('icons:document-save-symbolic.svg'), 'Download')
+            QIcon('ui:document-save-symbolic.svg'), 'Download')
         open.triggered.connect(self.download)
         cursor = QCursor()
         menu.exec(cursor.pos())
@@ -397,11 +289,13 @@ class BrowserApplication(QApplication):
 
 
 if __name__ == '__main__':
-    update_extenion_mapping()
-    # url = PurePosixPath('/vsis3') / 'gdal-io-test'
+    QDir.addSearchPath('ui', os.fspath(Path(__file__).resolve().parent / 'ui'))
+    update_extension_mapping()
+    url = PurePosixPath('/vsis3') / 'gdal-io-test'
     app = BrowserApplication([])
     browser = VSIFileSystemBrowser()
     app.connectGDAL(browser)
-    # browser.populate(str(url))
+    browser.populate(str(url))
+    browser.updateSSLStatus()
     browser.show()
     app.exec()

@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>800</width>
-    <height>780</height>
+    <width>484</width>
+    <height>481</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -33,6 +33,13 @@
            </item>
            <item>
             <widget class="QToolButton" name="refreshButton">
+             <property name="text">
+              <string/>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QToolButton" name="connectButton">
              <property name="text">
               <string/>
              </property>
@@ -113,8 +120,8 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>800</width>
-     <height>28</height>
+     <width>484</width>
+     <height>17</height>
     </rect>
    </property>
   </widget>

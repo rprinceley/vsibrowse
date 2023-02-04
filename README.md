@@ -1,7 +1,7 @@
 # vsibrowse
 Simple cloud browser example using GDAL virtual filesystem and PyQt6
 
-This is a stripped down example that shows how to use GDAL virtual filesystem functions to implement a simple browser. Use as you see fit.
+This is a stripped down example that shows how to use GDAL virtual filesystem functions to implement a simple browser. Use as you see fit. Please note that the function osgeo.gdal.GetSSLCertificates() is not present in upstream builds.
 
 <img src="https://github.com/rprinceley/vsibrowse/blob/main/images/vsibrowser.png?raw=true" width=800px >
 
