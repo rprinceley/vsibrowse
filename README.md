@@ -6,6 +6,6 @@ This is a stripped down example that shows how to use GDAL virtual filesystem fu
 Azure OAuth requires MSAL: https://github.com/AzureAD/microsoft-authentication-library-for-python.
 Google OAuth requires google_auth_oauthlib: https://github.com/googleapis/google-auth-library-python-oauthlib.
 
-<img src="https://github.com/rprinceley/vsibrowse/blob/main/images/vsibrowser.png?raw=true" width=800px >
+<img width="800" alt="vsibrowse" src="https://user-images.githubusercontent.com/1836337/216779757-cdb9d995-c0eb-4619-b89b-b9f2185aea52.png">
 
 Icons from Papirus icon theme (GPL): https://github.com/PapirusDevelopmentTeam/papirus-icon-theme.git
